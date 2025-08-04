@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 )
 
 type Message struct {
@@ -13,30 +15,36 @@ type Message struct {
 type Config struct {
 	ListenAddr        string
 	StoreProducerFunc StoreProducerFunc
+	CleanupInterval   time.Duration
 }
 
 type Server struct {
 	*Config
-
-	topics map[string]Storer
-
-	consumers []Consumer
-	producers []Producer
-	producech chan Message
-	quitch    chan struct{}
+	mu           sync.RWMutex
+	topics       map[string]Storer
+	cleanerStops map[string]chan struct{}
+	consumers    []Consumer
+	producers    []Producer
+	producech    chan Message
+	quitch       chan struct{}
 }
 
 func NewServer(cfg *Config) (*Server, error) {
 	producech := make(chan Message)
-	return &Server{
-		Config:    cfg,
-		topics:    make(map[string]Storer),
-		quitch:    make(chan struct{}),
-		producech: producech,
-		producers: []Producer{
-			NewHTTPProducer(cfg.ListenAddr, producech),
-		},
-	}, nil
+
+	s := &Server{
+		Config:       cfg,
+		topics:       make(map[string]Storer),
+		cleanerStops: make(map[string]chan struct{}),
+		quitch:       make(chan struct{}),
+		producech:    producech,
+	}
+
+	httpProducer := NewHTTPProducer(cfg.ListenAddr, producech)
+	httpProducer.server = s // Required!
+
+	s.producers = []Producer{httpProducer}
+	return s, nil
 }
 
 func (s *Server) Start() {
@@ -77,9 +85,31 @@ func (s *Server) publish(msg Message) (int, error) {
 }
 
 func (s *Server) getStoreForTopic(topic string) Storer {
-	if _, ok := s.topics[topic]; !ok {
-		s.topics[topic] = s.StoreProducerFunc()
-		slog.Info("created new topic", "topic", topic)
+	s.mu.RLock()
+	store, ok := s.topics[topic]
+	s.mu.RUnlock()
+	if ok {
+		return store
 	}
-	return s.topics[topic]
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double-check after locking
+	store, ok = s.topics[topic]
+	if ok {
+		return store
+	}
+
+	store = s.StoreProducerFunc()
+
+	stop := make(chan struct{})
+	store.StartRetentionCleaner(s.CleanupInterval, stop)
+
+	s.topics[topic] = store
+	s.cleanerStops[topic] = stop
+
+	slog.Info("created new topic", "topic", topic)
+	slog.Info("started retention cleaner", "topic", topic, "interval", s.CleanupInterval.String())
+	return store
 }

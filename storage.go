@@ -87,7 +87,7 @@ func (s *MemoryStore) Cleanup() {
 }
 
 func (s *MemoryStore) StartRetentionCleaner(interval time.Duration, stop <-chan struct{}) {
-	slog.Info("started retention cleaner", "topic", "interval", "5s")
+	slog.Info("started retention cleaner", "topic", "interval", interval)
 
 	ticker := time.NewTicker(interval)
 	go func() {
